@@ -261,6 +261,25 @@ IDP_NOMBRE:  ${IDP_NOMBRE:-Keycloak}
 
 El resto —validar la firma contra el JWKS, mapear rol a política— es OIDC puro.
 
+**El vault es un sistema de identidad, y se trata como tal.** Al deidentificar
+hacia el proveedor, el vault queda como el único componente capaz de revertirlo:
+la joya se mueve de lugar. Por eso no se abre con una credencial de servicio del
+gateway — valida el token **del usuario** contra el JWKS del IdP, ata cada mapeo
+al `sub`, y sólo esa identidad puede revertirlo:
+
+```
+POST /rehidratar  sin token            -> 401
+POST /rehidratar  con otra identidad   -> 403  (y queda auditado)
+[vault] rehidratacion_denegada sesion=… pidio=… dueno=…
+```
+
+Si el vault se abriera con la identidad del gateway, la trazabilidad llegaría
+hasta el gateway y ahí se cortaría: sabrías que algo se rehidrató, no quién lo
+pidió. El mapeo además se borra al responder, antes de llegar al TTL.
+
+> Gracias a [Alejandro Gabriel Cambeiro](https://www.linkedin.com/in/alejandro-gabriel-cambeiro/)
+> por señalar esto: la versión anterior abría el vault sin ninguna identidad.
+
 **El router es por palabras clave, no por LLM.** Determinístico y auditable.
 Un clasificador LLM en el router es un punto de inyección más.
 

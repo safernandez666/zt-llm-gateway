@@ -6,3 +6,4 @@ spacy==3.8.2
 torch==2.5.1
 transformers>=4.51.3,<5
 sentence-transformers>=3.3,<6
+PyJWT[crypto]==2.10.1

@@ -24,7 +24,7 @@ import re
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from pydantic import BaseModel, Field
 
 PRESIDIO_URL = os.getenv("PRESIDIO_URL", "http://presidio-analyzer:3000")
@@ -501,7 +501,61 @@ async def scan_output(req: ScanRequest):
 # se restituye. Mandar un PAN tokenizado seguiría metiendo al proveedor en el
 # alcance de PCI-DSS, y no hay caso de uso que lo justifique.
 
+# ---------------------------------------------------------------------------
+# Identidad para operar el vault
+# ---------------------------------------------------------------------------
+# El vault es el único componente capaz de revertir la deidentificación. Al
+# deidentificar hacia el proveedor, la joya se mueve de lugar: antes el dato
+# estaba repartido entre los sistemas de origen, cada uno con su control de
+# acceso; ahora hay un punto que además tiene la llave.
+#
+# Por eso NO alcanza con que el gateway venga con una credencial de servicio.
+# Si el vault se abre con la identidad del gateway, la trazabilidad llega
+# hasta el gateway y ahí se corta: podés saber que algo se rehidrató, no
+# quién lo pidió.
+#
+# Acá el vault valida el token DEL USUARIO contra el JWKS del IdP —no confía
+# en lo que el orquestador diga sobre quién es— y ata cada mapeo a ese sujeto.
+# Sólo la misma identidad que lo creó puede revertirlo, y queda registrado.
+KEYCLOAK_ISSUER = os.getenv("KEYCLOAK_ISSUER", "http://localhost:8085/realms/zt-llm")
+JWKS_URL = os.getenv("JWKS_URL", f"{os.getenv('KEYCLOAK_URL', 'http://keycloak:8085')}"
+                                 f"/realms/{os.getenv('KEYCLOAK_REALM', 'zt-llm')}"
+                                 f"/protocol/openid-connect/certs")
+_jwks = None
+
+
+def sujeto_del_token(authorization: str | None) -> str:
+    """Devuelve el `sub` del token, o lanza 401. Nunca confía en el llamador."""
+    global _jwks
+    from fastapi import HTTPException
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="falta el token del usuario")
+    token = authorization.split(" ", 1)[1]
+    try:
+        import jwt
+
+        if _jwks is None:
+            _jwks = jwt.PyJWKClient(JWKS_URL)
+        clave = _jwks.get_signing_key_from_jwt(token)
+        claims = jwt.decode(token, clave.key, algorithms=["RS256"],
+                            options={"verify_aud": False}, issuer=KEYCLOAK_ISSUER)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"token inválido: {e}")
+    return str(claims.get("sub") or claims.get("preferred_username") or "")
+
+
+def auditar(evento: str, **datos) -> None:
+    """Línea de auditoría del vault. Lo que no se registra, no se investiga."""
+    print("[vault] " + evento + " " +
+          " ".join(f"{k}={v}" for k, v in datos.items()), flush=True)
+
+
 VAULT: dict[str, dict[str, str]] = {}
+# session_id -> sub del usuario dueño del mapeo
+VAULT_DUENO: dict[str, str] = {}
 VAULT_TTL_SEG = 900
 _vault_ts: dict[str, float] = {}
 
@@ -533,6 +587,7 @@ def _purgar_vault() -> None:
     for sid in [s for s, t in _vault_ts.items() if ahora - t > VAULT_TTL_SEG]:
         VAULT.pop(sid, None)
         _vault_ts.pop(sid, None)
+        VAULT_DUENO.pop(sid, None)
 
 
 class PseudoRequest(BaseModel):
@@ -570,9 +625,14 @@ class RehidratarResponse(BaseModel):
 
 
 @app.post("/pseudonimizar", response_model=PseudoResponse)
-async def pseudonimizar(req: PseudoRequest):
-    """Reemplaza entidades por tokens antes de mandar el texto afuera."""
+async def pseudonimizar(req: PseudoRequest, authorization: str | None = Header(None)):
+    """Reemplaza entidades por tokens antes de mandar el texto afuera.
+
+    El mapeo queda atado al `sub` del token: sólo esa identidad podrá
+    revertirlo después.
+    """
     import time
+    sujeto = sujeto_del_token(authorization)
     _purgar_vault()
 
     findings = [f for f in await detect_entities(req.text) if f.end > f.start]
@@ -597,6 +657,7 @@ async def pseudonimizar(req: PseudoRequest):
     findings.sort(key=lambda f: f.start, reverse=True)
 
     mapa = VAULT.setdefault(req.session_id, {})
+    VAULT_DUENO[req.session_id] = sujeto
     _vault_ts[req.session_id] = time.time()
     # Mismo valor → mismo token dentro de la sesión. Si "María García" aparece
     # tres veces, el modelo tiene que poder ver que son la misma persona.
@@ -663,9 +724,20 @@ async def pseudonimizar(req: PseudoRequest):
 
 
 @app.post("/rehidratar", response_model=RehidratarResponse)
-async def rehidratar(req: RehidratarRequest):
-    """Restituye los valores reales en la respuesta que volvió del proveedor."""
+async def rehidratar(req: RehidratarRequest, authorization: str | None = Header(None)):
+    """Restituye los valores reales. Sólo para la identidad que creó el mapeo."""
+    from fastapi import HTTPException
+
+    sujeto = sujeto_del_token(authorization)
     _purgar_vault()
+
+    dueno = VAULT_DUENO.get(req.session_id)
+    if dueno and dueno != sujeto:
+        auditar("rehidratacion_denegada", sesion=req.session_id[:12],
+                pidio=sujeto, dueno=dueno)
+        raise HTTPException(status_code=403,
+                            detail="esta sesión pertenece a otra identidad")
+
     mapa = VAULT.get(req.session_id, {})
     texto = req.text
     n, detalle = 0, []
@@ -677,15 +749,24 @@ async def rehidratar(req: RehidratarRequest):
             entidad = token.strip("<>").rsplit("_", 1)[0]
             detalle.append((mapa[token], entidad))
             n += 1
+    if n:
+        auditar("rehidratacion", sesion=req.session_id[:12], sujeto=sujeto,
+                valores=n, tipos=",".join(sorted({e for _, e in detalle})))
     return RehidratarResponse(text=texto, restituidos=n, detalle=detalle)
 
 
 @app.delete("/vault/{session_id}")
-async def borrar_vault(session_id: str):
+async def borrar_vault(session_id: str, authorization: str | None = Header(None)):
     """El mapa se borra cuando termina la conversación. En producción esto va
     a Redis con TTL y cifrado en reposo, no en memoria del proceso."""
+    sujeto = sujeto_del_token(authorization)
+    dueno = VAULT_DUENO.get(session_id)
+    if dueno and dueno != sujeto:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="esta sesión pertenece a otra identidad")
     VAULT.pop(session_id, None)
     _vault_ts.pop(session_id, None)
+    VAULT_DUENO.pop(session_id, None)
     return {"ok": True}
 
 

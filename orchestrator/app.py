@@ -367,7 +367,7 @@ def system_para(ruta: str, con_tokens: bool) -> str:
 
 async def responder(prompt: str, modelo_destino: str, rol: str, ruta: str,
                     session_id: str, pseudonimizar: bool,
-                    pii_forzada: list) -> dict:
+                    pii_forzada: list, jwt_usuario: str = "") -> dict:
     """Cadena LCEL: prompt -> [pseudonimizar] -> modelo -> [re-hidratar].
 
     Acá está lo que cambió al migrar a LangChain, y es lo único que importa
@@ -394,6 +394,7 @@ async def responder(prompt: str, modelo_destino: str, rol: str, ruta: str,
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 f"{GUARDRAILS_URL}/pseudonimizar",
+                headers={"Authorization": jwt_usuario},
                 json={"text": humano.content, "session_id": session_id,
                       "forzar": [list(x) for x in pii_forzada]})
             ps = r.json()
@@ -405,12 +406,18 @@ async def responder(prompt: str, modelo_destino: str, rol: str, ruta: str,
         if not estado["pseudonimizado"] or texto.startswith(MARCA_ERROR):
             return texto
         async with httpx.AsyncClient(timeout=30) as client:
+            # Va el token del USUARIO, no una credencial del orquestador: el
+            # vault sólo se revierte con la identidad que lo creó, y queda
+            # registrado quién. Si fuera una identidad de servicio, la
+            # trazabilidad llegaría hasta acá y se cortaría.
             r = await client.post(f"{GUARDRAILS_URL}/rehidratar",
+                                  headers={"Authorization": jwt_usuario},
                                   json={"text": texto, "session_id": session_id})
             rh = r.json()
             estado["restituido"] = [tuple(x) for x in rh.get("detalle", [])]
             # El mapa muere con la consulta. No hay razón para conservarlo.
-            await client.delete(f"{GUARDRAILS_URL}/vault/{session_id}")
+            await client.delete(f"{GUARDRAILS_URL}/vault/{session_id}",
+                                headers={"Authorization": jwt_usuario})
         return rh["text"]
 
     def armar(_):
@@ -610,7 +617,8 @@ async def ask(
     try:
         r = await responder(prompt, destino, rol, ruta, session_id,
                             pseudonimizar=(SECURE and destino == "cloud"),
-                            pii_forzada=pii_forzada)
+                            pii_forzada=pii_forzada,
+                            jwt_usuario=authorization or "")
     except Exception as e:
         return Respuesta(modo=MODE, rol=rol, identidad=identidad, ruta=ruta,
                          bloqueado=True, motivo=f"error llamando al modelo: {e}",

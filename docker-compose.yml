@@ -183,6 +183,12 @@ services:
       PRESIDIO_URL: http://presidio-analyzer:3000
       # heuristic = rápido y offline. model = clasificador deberta (profile guardrails-ml).
       INJECTION_ENGINE: ${INJECTION_ENGINE:-heuristic}
+      # El vault valida el token del usuario contra el JWKS del IdP. No
+      # delega esa verificación en el orquestador: si lo hiciera, bastaría
+      # con comprometer el orquestador para revertir cualquier mapeo.
+      KEYCLOAK_URL: http://keycloak:8085
+      KEYCLOAK_REALM: zt-llm
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://localhost:8085/realms/zt-llm}
     ports:
       - "8002:8002"
     healthcheck:
