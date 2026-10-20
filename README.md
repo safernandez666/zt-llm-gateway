@@ -30,7 +30,7 @@ El saldo del cliente María García es de 152.340,75 y está en el segmento prem
 | LiteLLM | 4000 | gateway: virtual keys, budget, rate limit, guardrails |
 | Guardrails | 8002 | PII/PCI, injection, pseudonimización, embeddings y reranking |
 | Business API | 8003 | ABAC + field masking sobre MySQL |
-| Keycloak | 8085 | identidad: JWT con roles |
+| Keycloak | 8085 | identidad: JWT con roles (sustituible por Entra ID u Okta) |
 | Langfuse | 3100 | traza, costo, qué contexto se usó |
 | ChromaDB | 8010 | vector store del RAG |
 | Ollama | 11434 | modelo on-prem |
@@ -245,6 +245,21 @@ términos técnicos que nunca son PII para acotar los falsos positivos.
 **Los guardrails corren dos veces.** En el orquestador (capa de aplicación) y
 dentro de LiteLLM (capa de gateway). No es redundancia: el ataque 5 demuestra
 que el código de aplicación se saltea y el gateway no.
+
+**Keycloak es sustituible por tu IdP.** Está en la POC porque se levanta con el
+compose y no necesita un tenant. En producción el lugar lo ocupa Entra ID, Okta
+o el que ya administre las identidades. Lo único específico de Keycloak es dónde
+deja los roles en el token, y eso es una variable:
+
+```yaml
+# Keycloak  -> realm_access.roles   (default)
+# Entra ID  -> roles                (app roles) o groups
+# Okta      -> groups
+ROLES_CLAIM: ${ROLES_CLAIM:-realm_access.roles}
+IDP_NOMBRE:  ${IDP_NOMBRE:-Keycloak}
+```
+
+El resto —validar la firma contra el JWKS, mapear rol a política— es OIDC puro.
 
 **El router es por palabras clave, no por LLM.** Determinístico y auditable.
 Un clasificador LLM en el router es un punto de inyección más.
