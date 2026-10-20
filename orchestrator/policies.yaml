@@ -1,0 +1,85 @@
+# Policy engine: qué puede hacer cada rol.
+#
+# Las dos decisiones de ruteo del diagrama viven acá:
+#   1. rutas          -> a qué datos puede llegar la consulta
+#   2. modelos        -> a qué modelo puede ir ESE contexto
+#
+# La segunda es la que convierte "usamos IA" en "usamos IA sin mandarle
+# el negocio a un tercero": todo lo que toca datos de la empresa se
+# resuelve on-prem; sólo el chat general puede salir a la nube.
+
+default_role: soporte
+
+roles:
+
+  soporte:
+    rutas: [documental, negocio, general]
+    business_role: soporte
+    modelos:
+      # Soporte usa el modelo de frontera, igual que finanzas: todo lo que
+      # sale va pseudonimizado, así que el proveedor nunca ve un dato real.
+      # Esa es la tesis entera del stack; no tendría sentido aplicarla a un
+      # rol y no al otro.
+      documental: cloud
+      negocio: cloud
+      general: cloud
+    # Espeja los campos que el ABAC le da a este rol en la Business API
+    # (nombre, email, teléfono). Las dos capas tienen que coincidir: si el
+    # ABAC lo entrega y el guardrail lo tapa, rompés la respuesta sin ganar
+    # nada; si el ABAC lo oculta y el guardrail lo deja pasar, el control
+    # no existe.
+    ver_entidades: [PERSONA, UBICACION, ORGANIZACION, EMAIL_ADDRESS, PHONE_NUMBER]
+    budget_usd: 1.0
+    rpm: 20
+
+  finanzas:
+    rutas: [documental, negocio, general]
+    business_role: finanzas
+    modelos:
+      # Finanzas SÍ usa el modelo de frontera sobre datos de la empresa.
+      # Puede, porque todo lo que sale a "cloud" sale pseudonimizado: el
+      # proveedor ve <<PERSONA_1>>, nunca "María García".
+      documental: cloud
+      negocio: cloud
+      general: cloud
+    ver_entidades: [PERSONA, UBICACION, ORGANIZACION, EMAIL_ADDRESS, CUIT_AR]
+    budget_usd: 5.0
+    rpm: 60
+
+  auditoria:
+    rutas: [documental, negocio, general]
+    business_role: auditoria
+    modelos:
+      documental: local
+      negocio: local
+      # Auditoría es el caso estricto: ni siquiera pseudonimizado. Es el
+      # rol que ve el PAN completo, y ese contexto no sale de on-prem
+      # aunque los tokens lo harían seguro. Para eso está la rama local.
+      general: local
+    ver_entidades: [PERSONA, UBICACION, ORGANIZACION, EMAIL_ADDRESS, CUIT_AR, DNI_AR, PHONE_NUMBER]
+    budget_usd: 5.0
+    rpm: 60
+
+# El router clasifica por palabras clave: determinístico, auditable y
+# explicable. Un clasificador LLM acá es un punto de inyección más.
+router:
+  documental:
+    - politica
+    - política
+    - procedimiento
+    - reglamento
+    - gastos
+    - viaje
+    - viáticos
+    - vacaciones
+    - onboarding
+    - norma
+  negocio:
+    - cliente
+    - clientes
+    - saldo
+    - cuenta
+    - tarjeta
+    - factura
+    - cuit
+    - dni

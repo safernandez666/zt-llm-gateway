@@ -1,0 +1,407 @@
+# POC: Zero Trust LLM Gateway — asegurar desarrollos con LLM (frontera o no)
+#
+#   Puerto 8000  ->  Orquestador SIN gateway   (el "ANTES")  -> Ollama directo
+#   Puerto 8001  ->  Orquestador CON LiteLLM   (el "DESPUÉS") -> policy + guardrails + redaction
+#   Puerto 4000  ->  LiteLLM  (gateway: virtual keys, budgets, rate limit, guardrails)
+#   Puerto 8002  ->  Servicio de guardrails (Presidio + DNI/CUIT/CBU + prompt injection)
+#   Puerto 8003  ->  Business API (ABAC + field masking) sobre MySQL con datos mock
+#   Puerto 8085  ->  Keycloak (identidad: JWT + roles)
+#   Puerto 3100  ->  Langfuse (observabilidad y costos)
+#   Puerto 8010  ->  ChromaDB (RAG: políticas internas + 1 documento envenenado)
+#
+# Uso:
+#   cp .env.example .env
+#   docker compose up -d
+#   docker compose --profile setup run --rm seed     # carga el RAG y espera a Ollama
+#   python attack_llm.py
+#
+services:
+
+  # ====================================================================
+  # Identidad
+  # ====================================================================
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: zt_keycloak
+    command: ["start-dev", "--import-realm", "--http-port=8085"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_HEALTH_ENABLED: "true"
+      # Issuer canónico. Sin esto, Keycloak firma con el host por el que le
+      # pediste el token: localhost:8085 desde la máquina, keycloak:8085 desde
+      # la red de Docker. Dos issuers para el mismo usuario, y el validador
+      # rechaza uno de los dos haga lo que haga.
+      KC_HOSTNAME: http://localhost:8085
+      # ...y esto deja que el acceso interno siga funcionando por el nombre
+      # del contenedor sin cambiar el issuer.
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    ports:
+      - "8085:8085"
+    volumes:
+      - ./keycloak/realm-zt.json:/opt/keycloak/data/import/realm-zt.json:ro
+    healthcheck:
+      # La imagen no trae curl; usamos el health check nativo de Keycloak 26.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '\"status\": \"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks: [zt]
+
+  # ====================================================================
+  # Estado: Postgres (LiteLLM + Langfuse)  /  MySQL (datos de negocio)
+  # ====================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: zt_postgres
+    environment:
+      POSTGRES_USER: zt
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ztpass}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zt"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [zt]
+
+  mysql:
+    image: mysql:8.4
+    container_name: zt_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass}
+      MYSQL_DATABASE: negocio
+      MYSQL_USER: app
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-apppass}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [zt]
+
+  # ====================================================================
+  # Modelo local (on-prem)
+  # ====================================================================
+  ollama:
+    image: ollama/ollama:0.12.3
+    container_name: zt_ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks: [zt]
+
+  # ====================================================================
+  # RAG
+  # ====================================================================
+  chroma:
+    image: chromadb/chroma:0.5.23
+    container_name: zt_chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - chroma_data:/chroma/chroma
+    ports:
+      - "8010:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/v1/heartbeat').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks: [zt]
+
+  # ====================================================================
+  # Observabilidad y costos
+  # ====================================================================
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: zt_langfuse
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://zt:${POSTGRES_PASSWORD:-ztpass}@postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3100
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-nextauth-secret-cambiar}
+      SALT: ${LANGFUSE_SALT:-salt-cambiar}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      # Provisioning headless: deja las API keys listas para LiteLLM.
+      LANGFUSE_INIT_ORG_ID: zt-org
+      LANGFUSE_INIT_ORG_NAME: ZeroTrust
+      LANGFUSE_INIT_PROJECT_ID: zt-project
+      LANGFUSE_INIT_PROJECT_NAME: zt-llm-gateway
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-zt-poc}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-zt-poc}
+      LANGFUSE_INIT_USER_EMAIL: admin@zt.local
+      LANGFUSE_INIT_USER_NAME: Admin
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_USER_PASSWORD:-langfuse123}
+    ports:
+      - "3100:3000"
+    networks: [zt]
+
+  # ====================================================================
+  # Guardrails: PII / PCI / prompt injection
+  # ====================================================================
+  presidio-analyzer:
+    image: mcr.microsoft.com/presidio-analyzer:2.2.355
+    container_name: zt_presidio
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:3000/health').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks: [zt]
+
+  guardrails:
+    build: ./guardrails
+    container_name: zt_guardrails
+    depends_on:
+      presidio-analyzer:
+        condition: service_healthy
+    environment:
+      PRESIDIO_URL: http://presidio-analyzer:3000
+      # heuristic = rápido y offline. model = clasificador deberta (profile guardrails-ml).
+      INJECTION_ENGINE: ${INJECTION_ENGINE:-heuristic}
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8002/health').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks: [zt]
+
+  # ====================================================================
+  # Datos de negocio: ABAC + field masking
+  # ====================================================================
+  business-api:
+    build: ./business-api
+    container_name: zt_business_api
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_USER: app
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-apppass}
+      MYSQL_DB: negocio
+    ports:
+      - "8003:8003"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8003/health').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks: [zt]
+
+  # ====================================================================
+  # El gateway
+  # ====================================================================
+  litellm:
+    image: ghcr.io/berriai/litellm:main-v1.83.14-stable
+    container_name: zt_litellm
+    depends_on:
+      postgres:
+        condition: service_healthy
+      guardrails:
+        condition: service_healthy
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-zt-master}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:-sk-zt-salt}
+      DATABASE_URL: postgresql://zt:${POSTGRES_PASSWORD:-ztpass}@postgres:5432/litellm
+      STORE_MODEL_IN_DB: "True"
+      OLLAMA_BASE_URL: http://ollama:11434
+      GUARDRAILS_URL: http://guardrails:8002
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-no-key-configurada}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-zt-poc}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-zt-poc}
+      LANGFUSE_HOST: http://langfuse:3000
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+      - ./litellm/zt_guardrail.py:/app/zt_guardrail.py:ro
+    ports:
+      - "4000:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+    networks: [zt]
+
+  # ====================================================================
+  # Orquestador — la MISMA imagen, dos modos.
+  # ====================================================================
+  orchestrator-insecure:
+    build: ./orchestrator
+    container_name: zt_orch_insecure
+    depends_on:
+      chroma:
+        condition: service_healthy
+      business-api:
+        condition: service_healthy
+    environment:
+      SECURE_MODE: "0"
+      OLLAMA_BASE_URL: http://ollama:11434
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      BUSINESS_API_URL: http://business-api:8003
+      LOCAL_MODEL: ${LOCAL_MODEL:-llama3.2:3b}
+      CLOUD_MODEL: ${CLOUD_MODEL:-gpt-4o-mini}
+      # Acá está la key, suelta en el env de la aplicación. Es el punto.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      INSECURE_TARGET: ${INSECURE_TARGET:-cloud}
+    volumes:
+      - ./orchestrator/policies.yaml:/app/policies.yaml:ro
+    ports:
+      - "8000:8080"
+    networks: [zt]
+
+  orchestrator-secure:
+    build: ./orchestrator
+    container_name: zt_orch_secure
+    depends_on:
+      chroma:
+        condition: service_healthy
+      business-api:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      SECURE_MODE: "1"
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-zt-master}
+      KEYCLOAK_URL: http://keycloak:8085
+      KEYCLOAK_REALM: zt-llm
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://localhost:8085/realms/zt-llm}
+      # Cambiando estas dos, el stack corre con Entra ID u Okta:
+      #   Entra ID -> ROLES_CLAIM=roles      (o groups)
+      #   Okta     -> ROLES_CLAIM=groups
+      ROLES_CLAIM: ${ROLES_CLAIM:-realm_access.roles}
+      IDP_NOMBRE: ${IDP_NOMBRE:-Keycloak}
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      BUSINESS_API_URL: http://business-api:8003
+      GUARDRAILS_URL: http://guardrails:8002
+      LOCAL_MODEL: ${LOCAL_MODEL:-llama3.2:3b}
+      CLOUD_MODEL: ${CLOUD_MODEL:-gpt-4o-mini}
+      # El orquestador seguro NO tiene la key: sólo necesita saber si la rama
+      # cloud está habilitada. La credencial vive únicamente en LiteLLM.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ./orchestrator/policies.yaml:/app/policies.yaml:ro
+    ports:
+      - "8001:8080"
+    networks: [zt]
+
+  # ====================================================================
+  # El front por donde entran los usuarios
+  # ====================================================================
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:0.6.15
+    container_name: zt_openwebui
+    depends_on:
+      orchestrator-secure:
+        condition: service_started
+    environment:
+      # Apunta al ORQUESTADOR, no a LiteLLM: así la policy, el router, el
+      # ABAC y la pseudonimización siguen estando en el camino.
+      OPENAI_API_BASE_URL: http://orchestrator-secure:8080/v1
+      OPENAI_API_KEY: ${OPENWEBUI_API_KEY:-sk-zt-finanzas}
+      WEBUI_AUTH: "false"
+      ENABLE_OLLAMA_API: "false"
+      WEBUI_NAME: Asistente Corporativo
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_TITLE_GENERATION: "false"
+    volumes:
+      - openwebui_data:/app/backend/data
+    ports:
+      - "3000:8080"
+    networks: [zt]
+
+  # ====================================================================
+  # Ingesta documental: PDF / DOCX / Markdown -> chunks -> ChromaDB
+  # ====================================================================
+  ingestor:
+    build: ./ingestor
+    container_name: zt_ingestor
+    profiles: ["setup"]
+    depends_on:
+      chroma:
+        condition: service_healthy
+      guardrails:
+        condition: service_healthy
+    environment:
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      GUARDRAILS_URL: http://guardrails:8002
+      COLLECTION: politicas-internas
+      DOCS_DIR: /documentos
+      CHUNK_CHARS: ${CHUNK_CHARS:-1200}
+      # En una empresa esto va en 1. Acá en 0 porque la POC necesita el
+      # documento envenenado indexado para demostrar la inyección indirecta.
+      INGESTA_BLOQUEA: ${INGESTA_BLOQUEA:-0}
+    volumes:
+      - ./documentos:/documentos
+      - ./seed/docs:/origen:ro
+    networks: [zt]
+
+  # ====================================================================
+  # Setup de una sola vez: pull del modelo + carga del RAG + virtual keys
+  # ====================================================================
+  seed:
+    build: ./seed
+    container_name: zt_seed
+    profiles: ["setup"]
+    depends_on:
+      chroma:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+    environment:
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      OLLAMA_BASE_URL: http://ollama:11434
+      LITELLM_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-zt-master}
+      LOCAL_MODEL: ${LOCAL_MODEL:-llama3.2:3b}
+    volumes:
+      - ./seed/docs:/app/docs:ro
+    networks: [zt]
+
+volumes:
+  openwebui_data:
+  postgres_data:
+  mysql_data:
+  chroma_data:
+  ollama_data:
+
+networks:
+  zt:
+    driver: bridge

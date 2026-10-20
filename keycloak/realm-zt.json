@@ -1,0 +1,99 @@
+{
+  "realm": "zt-llm",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "accessTokenLifespan": 1800,
+  "roles": {
+    "realm": [
+      {
+        "name": "soporte",
+        "description": "Mesa de ayuda: ve clientes sin datos financieros"
+      },
+      {
+        "name": "finanzas",
+        "description": "Finanzas: ve saldos y CUIT, no ve PAN completo"
+      },
+      {
+        "name": "auditoria",
+        "description": "Auditoría: ve todo, nunca sale a la nube"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "zt-poc",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": [
+        "*"
+      ],
+      "webOrigins": [
+        "*"
+      ],
+      "protocol": "openid-connect",
+      "fullScopeAllowed": true
+    }
+  ],
+  "users": [
+    {
+      "username": "soporte1",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Sofia",
+      "lastName": "Soporte",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "soporte123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "soporte"
+      ],
+      "email": "soporte1@zt.local",
+      "requiredActions": []
+    },
+    {
+      "username": "finanzas1",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Fede",
+      "lastName": "Finanzas",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "finanzas123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "finanzas"
+      ],
+      "email": "finanzas1@zt.local",
+      "requiredActions": []
+    },
+    {
+      "username": "auditor1",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Ana",
+      "lastName": "Auditoria",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "auditor123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "auditoria"
+      ],
+      "email": "auditor1@zt.local",
+      "requiredActions": []
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+# Secretos reales. El .env.example tiene todos los defaults de la POC.
+.env
+
+# Artefactos de build de los diagramas (4,7 MB de evidencia de archify)
+.archify/
+
+# Capturas y corpus generado: se reproducen corriendo la POC
+capturas/
+documentos/
+
+# Salidas de los scripts
+resultados.md
+ruteo.md
+
+# Contenido editorial del blog, no es parte de la POC
+post*.md
+linkedin-*.txt
+publicar_draft.py
+draft_state.json
+
+__pycache__/
+*.pyc
+.DS_Store

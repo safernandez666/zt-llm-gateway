@@ -1,0 +1,45 @@
+# LiteLLM: el único punto con credenciales, budget y trazas.
+#
+# El orquestador NO tiene la API key de nadie. Pide con una virtual key que
+# este gateway emitió, con su propio límite de gasto y de rate. Si esa key se
+# filtra, lo que se filtró es un presupuesto de 1 dólar, no tu cuenta.
+
+model_list:
+  # On-prem. Todo lo que toca datos de la empresa termina acá.
+  - model_name: llama-local
+    litellm_params:
+      model: ollama_chat/llama3.2:1b
+      api_base: os.environ/OLLAMA_BASE_URL
+
+  # Nube. Sólo chat general, y sólo para los roles que la policy habilita.
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+# Los guardrails viven en el GATEWAY, no en la aplicación.
+# Esa es la diferencia entre "mi app valida" y "nadie puede saltearse la
+# validación": si alguien se roba una virtual key y le pega directo a :4000
+# salteando el orquestador, estos hooks siguen corriendo.
+guardrails:
+  - guardrail_name: "zt-input"
+    litellm_params:
+      guardrail: zt_guardrail.ZeroTrustGuardrail
+      mode: "pre_call"
+      default_on: true
+
+  - guardrail_name: "zt-output"
+    litellm_params:
+      guardrail: zt_guardrail.ZeroTrustGuardrail
+      mode: "post_call"
+      default_on: true
+
+litellm_settings:
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+  drop_params: true
+  set_verbose: false
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
